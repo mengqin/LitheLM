@@ -1,0 +1,334 @@
+version: 1
+experiment:
+  name: tlm
+  model_size: 7.4M
+  seed: 1337
+  resume_from: null
+  tags:
+  - tlm
+  - tinystories
+  - 7m
+  - pt
+  - sft
+  - replay
+tokenizer:
+  type: bpe
+  vocab_size: 4096
+  artifact: ${paths.tokenizer_root}/tlm_4096/tokenizer.json
+  train_from:
+    dataset: tinystories_pt_train
+    sample_bytes: 10485760
+  special_tokens: []
+  reuse_across_stages: true
+runtime:
+  device: auto
+  precision: bf16
+  deterministic: false
+  matmul_precision: high
+  compile: false
+  detect_anomaly: false
+distributed:
+  strategy: single
+  backend: auto
+  find_unused_parameters: false
+  timeout_minutes: 30
+model:
+  vocab_size: 4096
+  hidden_size: 256
+  max_position_embeddings: 256
+  tie_word_embeddings: true
+  lm_head_bias: false
+  auto_project_width_changes: false
+  position_embedding:
+    type: learned_absolute
+    max_positions: 256
+  embeddings:
+    dropout: 0.05
+  init:
+    std: 0.02
+    scale_residual_projections: true
+  final_norm:
+    type: layernorm
+    eps: 1.0e-05
+  layer_defaults:
+    hidden_size: 256
+    residual: true
+    norm_position: pre
+    norm:
+      type: layernorm
+      eps: 1.0e-05
+    mixer:
+      type: attention
+      attention:
+        impl: sdpa
+        num_heads: 8
+        num_kv_heads: 8
+        head_dim: 32
+        causal: true
+        qkv_bias: true
+        out_bias: true
+        attention_dropout: 0.05
+        output_dropout: 0.05
+    ffn:
+      type: standard
+      hidden_size: 1024
+      activation: gelu
+      gated: false
+      bias: true
+      dropout: 0.05
+  layers:
+  - repeat: 8
+    type: transformer
+datasets:
+  tinystories_pt_train:
+    source: text
+    path: ${paths.corpus_root}/tinystories/TinyStories-train.txt
+    split: train
+    objective: pt
+    text_field: text
+    shuffle: true
+    kwargs:
+      stream_mode: continuous
+      sample_mode: random_window
+  tinystories_pt_val:
+    source: text
+    path: ${paths.corpus_root}/tinystories/TinyStories-valid.txt
+    split: validation
+    objective: pt
+    text_field: text
+    shuffle: false
+    kwargs:
+      stream_mode: continuous
+      sample_mode: random_window
+  tinystories_instruct_train:
+    source: text
+    path: ${paths.corpus_root}/tinystories_instruct/TinyStories-Instruct-train.txt
+    split: train
+    objective: sft
+    text_field: text
+    shuffle: true
+    kwargs:
+      stream_mode: continuous
+      sample_mode: random_window
+      max_chars: 419430400
+      format: tinystories_instruct
+      response_marker: 'Story:
+
+        '
+      loss_mask: all_tokens
+  tinystories_instruct_val:
+    source: text
+    path: ${paths.corpus_root}/tinystories_instruct/TinyStories-Instruct-valid.txt
+    split: validation
+    objective: sft
+    text_field: text
+    shuffle: false
+    kwargs:
+      stream_mode: continuous
+      sample_mode: random_window
+      format: tinystories_instruct
+      response_marker: 'Story:
+
+        '
+      loss_mask: all_tokens
+stages:
+- name: pt
+  type: pt
+  max_steps: 60000
+  batch:
+    micro_batch_size: 32
+    grad_accum_steps: 1
+    max_grad_norm: 1.0
+  data:
+    max_length: 256
+    packing: true
+    datasets:
+    - name: tinystories_pt_train
+      weight: 1.0
+  curriculum:
+  - until_step: 60000
+    max_length: 256
+    weights:
+      tinystories_pt_train: 1.0
+  optimizer:
+    type: adamw
+    lr: 0.0003
+    betas:
+    - 0.9
+    - 0.95
+    eps: 1.0e-08
+    weight_decay: 0.1
+    exclude_from_weight_decay:
+    - bias
+    - norm
+    - embedding
+  lr_schedule:
+    type: wsd
+    warmup_steps: 1000
+    stable_steps: 54000
+    decay_steps: 5000
+    min_lr: 3.0e-05
+    decay_style: cosine
+  intervals:
+    log: 10
+    stats: 100
+    eval: 500
+    checkpoint: 1000
+  stats:
+    items:
+    - grad_norm
+    - param_norm
+    - update_ratio
+    - gpu_memory
+    - input_tokens_per_sec
+    - target_tokens_per_sec
+    - samples_per_sec
+    model_internal:
+      enabled: false
+      items: []
+  eval:
+    datasets:
+    - name: tinystories_pt_val
+      alias: pt_val
+    metrics:
+    - nll
+    - ppl
+    max_batches: 50
+    batch_size: 32
+    generate:
+      enabled: true
+      every: 1000
+      prompts:
+      - Once upon a time
+      - There was a little girl named
+      max_new_tokens: 200
+      temperature: 0.8
+      top_k: 50
+  checkpoint:
+    keep_last: 3
+    save_optimizer: true
+    save_scheduler: true
+    save_metrics: true
+    best_metric: eval/pt_val/nll
+    best_mode: min
+    export_final: true
+- name: sft
+  type: sft
+  max_steps: 4000
+  init_from:
+    stage: pt
+    checkpoint: best
+    load_model: true
+    load_optimizer: false
+    load_scheduler: false
+    reset_stage_step: true
+  batch:
+    micro_batch_size: 32
+    grad_accum_steps: 1
+    max_grad_norm: 1.0
+  data:
+    max_length: 256
+    packing: true
+    datasets:
+    - name: tinystories_instruct_train
+      objective: sft
+      weight: 0.9
+    - name: tinystories_pt_train
+      objective: pt
+      weight: 0.1
+  curriculum:
+  - until_step: 4000
+    max_length: 256
+    weights:
+      tinystories_instruct_train: 0.9
+      tinystories_pt_train: 0.1
+  optimizer:
+    type: adamw
+    lr: 3.0e-05
+    betas:
+    - 0.9
+    - 0.95
+    eps: 1.0e-08
+    weight_decay: 0.1
+    exclude_from_weight_decay:
+    - bias
+    - norm
+    - embedding
+  lr_schedule:
+    type: wsd
+    warmup_steps: 100
+    stable_steps: 3400
+    decay_steps: 500
+    min_lr: 3.0e-06
+    decay_style: cosine
+  intervals:
+    log: 10
+    stats: 50
+    eval: 250
+    checkpoint: 500
+  stats:
+    items:
+    - grad_norm
+    - param_norm
+    - update_ratio
+    - gpu_memory
+    - input_tokens_per_sec
+    - target_tokens_per_sec
+    - samples_per_sec
+    - objective_ratio
+    - objective_nll
+    model_internal:
+      enabled: false
+      items: []
+  eval:
+    datasets:
+    - name: tinystories_instruct_val
+      alias: sft_val
+    - name: tinystories_pt_val
+      alias: pt_holdout
+    metrics:
+    - nll
+    - ppl
+    max_batches: 50
+    batch_size: 32
+    generate:
+      enabled: true
+      every: 500
+      prompts:
+      - 'Summary: A brave mouse shares cake with a dragon.
+
+        Words: dragon, cake, brave
+
+        Story:'
+      - 'Features: Dialogue
+
+        Summary: Two friends find a lost puppy.
+
+        Story:'
+      max_new_tokens: 200
+      temperature: 0.8
+      top_k: 50
+  checkpoint:
+    keep_last: 3
+    save_optimizer: true
+    save_scheduler: true
+    save_metrics: true
+    best_metric: eval/sft_val/nll
+    best_mode: min
+    export_final: true
+logging:
+  rank0_only: true
+  stdout: true
+  jsonl: true
+  jsonl_file: metrics.jsonl
+  flush_every: 1
+  tensorboard:
+    enabled: false
+  wandb:
+    enabled: false
+inference:
+  max_new_tokens: 256
+  do_sample: true
+  temperature: 0.8
+  top_p: 1.0
+  top_k: 50

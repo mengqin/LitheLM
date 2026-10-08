@@ -1,0 +1,50 @@
+version: 1
+experiment:
+  name: synthetic
+  model_size: 26.7K
+runtime:
+  device: cpu
+  precision: fp32
+tokenizer:
+  vocab_size: 280
+  artifact: ${paths.tokenizer_root}/synthetic/tokenizer.json
+  train_from:
+    dataset: stories
+    sample_bytes: 8192
+model:
+  vocab_size: 280
+  hidden_size: 32
+  max_position_embeddings: 32
+  position_embedding: {type: learned_absolute, max_positions: 32}
+  layer_defaults:
+    norm: {type: layernorm}
+    mixer:
+      attention: {num_heads: 4}
+    ffn: {type: standard, hidden_size: 64, activation: gelu}
+  layers:
+    - {type: transformer, repeat: 2}
+datasets:
+  stories: {source: text, path: "${paths.corpus_root}/synthetic/stories.txt", objective: pt}
+  instruct: {source: json, path: "${paths.corpus_root}/synthetic/instruct.jsonl", objective: sft}
+stages:
+  - name: pt
+    max_steps: 6
+    batch: {micro_batch_size: 2, grad_accum_steps: 2}
+    data:
+      max_length: 32
+      packing: true
+      datasets: [{name: stories}]
+    lr_schedule: {warmup_steps: 1, decay_steps: 2}
+    intervals: {log: 1, stats: 2, eval: 3, checkpoint: 3}
+    eval: {datasets: [stories], max_batches: 2}
+  - name: sft
+    type: sft
+    max_steps: 4
+    batch: {micro_batch_size: 2, grad_accum_steps: 2}
+    data:
+      max_length: 32
+      packing: true
+      datasets: [{name: instruct, weight: 0.9}, {name: stories, weight: 0.1}]
+    lr_schedule: {warmup_steps: 1, decay_steps: 1}
+    intervals: {log: 1, stats: 2, eval: 2, checkpoint: 2}
+    eval: {datasets: [stories, instruct], max_batches: 2}

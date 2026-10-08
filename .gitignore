@@ -1,0 +1,16 @@
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+data/
+outputs/
+corpora/
+tokenizers/
+runs/
+artifacts/
+dist/
+*.pt
+*.bin
+*.safetensors
+build/

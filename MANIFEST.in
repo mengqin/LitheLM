@@ -1,0 +1,6 @@
+include LICENSE README.md CONTRIBUTING.md SECURITY.md CHANGELOG.md requirements.txt
+include .github/PULL_REQUEST_TEMPLATE.md
+recursive-include configs *.yaml
+recursive-include examples *.py *.md
+recursive-include scripts *.py
+recursive-include tests *.py

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lithelm"
+version = "0.1.0"
+description = "A lightweight, configurable framework for language model training and architecture research"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dynamic = ["dependencies"]
+
+[project.urls]
+Repository = "https://github.com/mengqin/LitheLM"
+Issues = "https://github.com/mengqin/LitheLM/issues"
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+examples = ["matplotlib>=3.8"]
+fla = ["flash-linear-attention>=0.4; sys_platform == 'linux'"]
+triton-linux = ["triton>=3; sys_platform == 'linux'"]
+wandb = ["wandb"]
+tensorboard = ["tensorboard"]
+
+[project.scripts]
+lithelm = "lithelm.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lithelm*"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["gpu: requires CUDA", "integration: subprocess training checks"]
