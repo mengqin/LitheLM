@@ -48,7 +48,8 @@ def record_environment(cfg, tokenizer=None, accelerator=None):
     commit = command(["git", "rev-parse", "HEAD"], source)
     status = command(["git", "status", "--porcelain"], source)
     versions = {name:package_version(name) for name in ["lithelm", "torch", "transformers", "accelerate", "datasets",
-                                                       "triton", "triton-windows", "flash-linear-attention"]}
+                                                       "triton", "triton-windows", "flash-linear-attention",
+                                                       "flash-attn", "flash-attn-3"]}
     from . import __version__
     versions["lithelm"] = versions["lithelm"] or __version__
     data = dict(recorded_at=datetime.now(timezone.utc).isoformat(), versions=versions, git_commit=commit,

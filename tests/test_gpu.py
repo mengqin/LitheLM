@@ -14,6 +14,10 @@ if torch.cuda.is_available() and "LITHELM_GPU_MEMORY_FRACTION" in os.environ:
     torch.cuda.set_per_process_memory_fraction(float(os.environ["LITHELM_GPU_MEMORY_FRACTION"]))
 
 
+FLASH_IMPL = pytest.param("flash", marks=pytest.mark.skipif(
+    not torch.backends.cuda.is_flash_attention_available(), reason="PyTorch Flash backend not compiled"))
+
+
 @pytest.mark.parametrize("dtype",[torch.float16,torch.bfloat16,torch.float32])
 @pytest.mark.parametrize("length,dim",[(17,16),(64,32),(129,64),(7,128)])
 def test_triton_forward_backward(dtype,length,dim):
@@ -75,11 +79,13 @@ def test_fla_mixed_model(tmp_path):
     assert torch.isfinite(result.loss)
 
 
-@pytest.mark.parametrize("impl", ["sdpa", "flash"])
+@pytest.mark.parametrize("impl", ["sdpa", FLASH_IMPL, "flash2"])
 def test_dense_causal_forward_backward(tmp_path, impl):
     from lithelm.data import collate
     cfg = tiny_config(tmp_path)
     cfg["model"]["layers"][0]["mixer"]["attention"].update(impl=impl)
+    if impl == "flash2":
+        pytest.importorskip("flash_attn")
     model = build_model(cfg["model"]).cuda()
     batch = collate([dict(input_ids=list(range(17)), labels=list(range(17)))]*2, 16, target_mode="next_token")
     assert "attention_mask" not in batch
@@ -118,17 +124,60 @@ a.end_training()
     assert result.returncode == 0, result.stdout+result.stderr
 
 
-@pytest.mark.parametrize("impl", ["sdpa", "flash", "triton"])
+@pytest.mark.parametrize("impl", ["sdpa", FLASH_IMPL, "flash2", "triton"])
 @pytest.mark.parametrize("position", ["rope", "learned_absolute"])
 def test_cached_attention_logits(tmp_path, impl, position):
     from test_cache import cache_config, compare_cached
     if impl == "triton":
         pytest.importorskip("triton")
+    if impl == "flash2":
+        pytest.importorskip("flash_attn")
     torch.manual_seed(47)
     model = build_model(cache_config(tmp_path, position, impl=impl)["model"]).cuda().eval()
     ids = torch.randint(0, 280, (2, 12), device="cuda")
     with torch.autocast("cuda", dtype=torch.bfloat16):
         compare_cached(model, ids, atol=3e-3, rtol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("q_length,k_length,causal", [(17, 17, True), (1, 9, False), (7, 9, False)])
+def test_flash2_outputs_and_gradients(dtype, q_length, k_length, causal):
+    pytest.importorskip("flash_attn")
+    values = [torch.randn(2, 2, length, 16, device="cuda", dtype=dtype, requires_grad=True)
+              for length in (q_length, k_length, k_length)]
+    out = attention_op(*values, impl="flash2", causal=causal)
+    reference = attention_reference(*(value.float() for value in values), causal=causal)
+    grad = torch.randn_like(out)
+    expected = torch.autograd.grad(reference, values, grad.float())
+    actual = torch.autograd.grad(out, values, grad)
+    tolerance = 2e-2 if dtype == torch.bfloat16 else 3e-3
+    torch.testing.assert_close(out, reference.to(dtype), atol=tolerance, rtol=tolerance)
+    for result, target in zip(actual, expected):
+        torch.testing.assert_close(result, target, atol=tolerance, rtol=tolerance)
+
+
+def test_flash2_training_dropout():
+    function = pytest.importorskip("flash_attn").flash_attn_func
+    values = [torch.randn(2, 2, 17, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+              for _ in range(3)]
+    cuda_state = torch.cuda.get_rng_state()
+    expected = function(*(value.transpose(1, 2) for value in values), causal=True, dropout_p=.2,
+                        deterministic=torch.are_deterministic_algorithms_enabled()).transpose(1, 2)
+    torch.cuda.set_rng_state(cuda_state)
+    out = attention_op(*values, impl="flash2", dropout=.2)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    out.float().sum().backward()
+    assert all(torch.isfinite(value.grad).all() for value in values)
+
+
+def test_compiled_flash2():
+    pytest.importorskip("flash_attn")
+    values = [torch.randn(2, 2, 17, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+              for _ in range(3)]
+    compiled = torch.compile(lambda q, k, v:attention_op(q, k, v, impl="flash2"), backend="eager")
+    out = compiled(*values)
+    out.float().sum().backward()
+    assert torch.isfinite(out).all() and all(torch.isfinite(value.grad).all() for value in values)
 
 
 @pytest.mark.parametrize("hybrid", [False, True])

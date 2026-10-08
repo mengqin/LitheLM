@@ -11,7 +11,7 @@ from test_data import tiny_config
 
 
 def run(*args):
-    result=subprocess.run([sys.executable,"-m","lithelm",*map(str,args)],capture_output=True,text=True,
+    result=subprocess.run([sys.executable,"-m","lithelm",*map(str,args)],capture_output=True,encoding="utf-8",
                           env={**os.environ,"OMP_NUM_THREADS":"1"},timeout=120)
     assert result.returncode==0,result.stdout+result.stderr
     return result.stdout
@@ -51,6 +51,22 @@ def test_pt_checkpoint_resume_sft_eval_infer(tmp_path):
     assert result["eval/nll"]>0 and result["eval/pt/tokens"]>0
     text=run("infer",path,"--checkpoint",final,"--prompt","A happy cat","--max-new-tokens",3)
     assert "A happy cat" in text
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows legacy stdout encodings")
+@pytest.mark.parametrize("encoding", ["cp1252", "gbk"])
+def test_infer_unicode_stdout(tmp_path, monkeypatch, encoding):
+    cfg = tiny_config(tmp_path)
+    path = tmp_path/"config.yaml"
+    OmegaConf.save(OmegaConf.create(cfg), path)
+    run("train", path, "--stop-after", 1)
+    checkpoint = Path(cfg["experiment"]["output_dir"])/"pt/checkpoint-1"
+    monkeypatch.setenv("PYTHONIOENCODING", encoding)
+    prompt = "\u732b \u2603 \U0001f408"
+    assert run("infer", path, "--checkpoint", checkpoint, "--prompt", prompt,
+               "--max-new-tokens", 0).strip() == prompt
+    record = json.loads((checkpoint.parent.parent/"inference/samples.jsonl").read_text(encoding="utf-8"))
+    assert record["prompt"] == record["text"] == prompt
 
 
 def test_incompatible_resume_rejected(tmp_path):

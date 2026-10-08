@@ -4,11 +4,32 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 import pytest
 import torch
 from omegaconf import OmegaConf
 from test_data import tiny_config
+
+
+def run_distributed(*args):
+    env = {**os.environ, "OMP_NUM_THREADS":"1", "PYTHONIOENCODING":"utf-8"}
+    command = [sys.executable, "-m", "torch.distributed.run", "--nproc_per_node=2"]
+    with tempfile.TemporaryDirectory() as rendezvous:
+        if sys.platform == "win32":
+            # torchrun's TCP rendezvous ignores USE_LIBUV in some supported
+            # PyTorch versions. Keep its agent on FileStore and let the workers
+            # create the legacy TCPStore through env://.
+            env.pop("USE_LIBUV", None)
+            env["TORCH_DISABLE_SHARE_RDZV_TCP_STORE"] = "1"
+            command += ["--rdzv_backend=c10d", "--rdzv_conf=store_type=file",
+                        f"--rdzv_endpoint={Path(rendezvous)/'store'}", "--local_addr=127.0.0.1"]
+        else:
+            command += ["--standalone"]
+        result = subprocess.run(command+list(map(str, args)), capture_output=True,
+                                encoding="utf-8", errors="replace", env=env, timeout=120)
+    assert result.returncode == 0, result.stdout+result.stderr
+    return result
 
 
 @pytest.mark.integration
@@ -30,12 +51,9 @@ def test_two_rank_resume_and_eval(tmp_path,target_mode):
     config=tmp_path/"config.yaml"
     OmegaConf.save(OmegaConf.create(cfg),config)
     root=Path(cfg["experiment"]["output_dir"])
-    env={**os.environ,"OMP_NUM_THREADS":"1"}
-    command=[sys.executable,"-m","torch.distributed.run","--standalone","--nproc_per_node=2","-m","lithelm","train",str(config)]
     resume = "latest" if target_mode == "next_token" else str(root/"pt/checkpoint-2")
     for args in (["--stop-after","2"],["--resume",resume]):
-        out=subprocess.run(command+args,text=True,capture_output=True,env=env,timeout=120)
-        assert out.returncode==0,out.stdout+out.stderr
+        run_distributed("-m", "lithelm", "train", config, *args)
         if args[0] == "--stop-after":
             path = root/"pt/checkpoint-2"
             assert all((path/f"random_states_{rank}.pkl").is_file() for rank in range(2))
@@ -45,7 +63,7 @@ def test_two_rank_resume_and_eval(tmp_path,target_mode):
     assert state["world_size"]==2 and state["scheduler_position"]==3 and state["global_step"]==7
     rows=[json.loads(x) for x in (root/"metrics.jsonl").read_text().splitlines()]
     distributed=[r for r in rows if r["global_step"]==7 and "eval/nll" in r][-1]
-    out=subprocess.run([sys.executable,"-m","lithelm","eval",str(config),"--checkpoint",str(final)],text=True,capture_output=True,env=env,timeout=60)
+    out=subprocess.run([sys.executable,"-m","lithelm","eval",str(config),"--checkpoint",str(final)],encoding="utf-8",capture_output=True,env={**os.environ,"OMP_NUM_THREADS":"1"},timeout=60)
     assert out.returncode==0,out.stdout+out.stderr
     single=json.loads(out.stdout)
     for key,value in single.items():
@@ -87,9 +105,7 @@ class Probe(nn.Module):
 CUSTOM_LAYERS['probe']=Probe
 train(load_config(sys.argv[1]))
 ''')
-    command=[sys.executable,'-m','torch.distributed.run','--standalone','--nproc_per_node=2',str(script),str(config)]
-    result=subprocess.run(command,text=True,capture_output=True,env={**os.environ,'OMP_NUM_THREADS':'1'},timeout=120)
-    assert result.returncode==0,result.stdout+result.stderr
+    run_distributed(script, config)
     rows=[json.loads(line) for line in (Path(cfg['experiment']['output_dir'])/'metrics.jsonl').read_text().splitlines()]
     stats=[row for row in rows if row.get('event')=='model_stats']
     assert len(stats)==4
@@ -147,10 +163,7 @@ try:
 finally:
     a.end_training()
 ''')
-    command = [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node=2",
-               str(script), str(config), invalid]
-    result = subprocess.run(command, text=True, capture_output=True, env={**os.environ, "OMP_NUM_THREADS":"1"}, timeout=120)
-    assert result.returncode == 0, result.stdout+result.stderr
+    run_distributed(script, config, invalid)
     for rank in range(2):
         message = json.loads((tmp_path/f"rank-{rank}.json").read_text())
         assert f"precision={cfg['runtime']['precision']} grad_norm=" in message

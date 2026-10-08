@@ -66,6 +66,9 @@ For example, `python -m pip install -e ".[triton-linux,fla]"` adds both optional
 
 `python -m lithelm` exposes the same commands as `lithelm`. Run `lithelm --help` or `lithelm train --help` for command syntax. The shell examples below use Bash.
 
+On Windows, the CLI writes UTF-8 to stdout and stderr, including redirected output. Decode captured output as UTF-8.
+For GPU runs on Windows, set `$env:PYTHONUTF8 = "1"` before launching Python so optional compiler libraries read UTF-8 sources.
+
 ## Quick start
 
 ### Train on CPU
@@ -441,15 +444,36 @@ Global batch size is `micro_batch_size × grad_accum_steps × world_size`. Adjus
 | Backend | Use and constraints |
 |---|---|
 | `attention.impl: sdpa` | Default PyTorch scaled dot-product attention |
-| `attention.impl: flash` | Forces the PyTorch Flash backend; unsupported device/mask combinations raise errors |
+| `attention.impl: flash` | Forces the PyTorch SDPA Flash backend |
+| `attention.impl: flash2` | Calls external FlashAttention-2 (`flash_attn.flash_attn_func`) |
+| `attention.impl: flash3` | Calls external FlashAttention-3 (`flash_attn_interface.flash_attn_func`); attention dropout must be 0 |
 | `attention.impl: triton` | Research operator: PyTorch GEMMs and Triton masked-softmax forward/backward; CUDA fp16/bf16/fp32, head dimensions 16/32/64/128, length ≤ 1024, attention dropout 0 |
 | `attention.impl: custom` | Calls the named function in `CUSTOM_OPS` |
+
+Choose `flash2` or `flash3` after installing the corresponding library for your GPU and PyTorch/CUDA build. LitheLM calls the selected library without capability probes or fallback; missing libraries and kernel failures raise errors. For RTX 5090 builds where FA3 is unsupported, choose `flash2`.
+
+The external backends accept dense batches without an explicit attention mask. Use `sdpa` for padded batches. Causal calls require equal query/key lengths to preserve mask alignment; cached single-token decoding uses non-causal attention over the stored prefix and supports both external backends.
 
 The Triton operator materializes an attention matrix with O(batch × heads × length²) memory and supports first-order gradients. Use it for operator experiments; benchmark your workload before choosing it for performance.
 
 FLA layers preserve FLA initialization and no-weight-decay markers. Set `mixer.type: gdn` and pass options through `mixer.gdn.mode` and `mixer.gdn.kwargs`. FLA reports unsupported configurations.
 
 Linux CUDA launches use NCCL where available; CPU and Windows use Gloo. CPU CI covers Linux and Windows. Install optional GPU libraries that support your platform. The Python run context changes process-wide working-directory and cache settings, so run concurrent experiments in separate processes.
+
+For a local two-process CPU launch on Windows, use a file rendezvous when the PyTorch build lacks libuv. From PowerShell:
+
+```powershell
+$env:USE_LIBUV = "0"
+$env:TORCH_DISABLE_SHARE_RDZV_TCP_STORE = "1"
+python -m torch.distributed.run --nnodes=1 --nproc_per_node=2 `
+  --rdzv_backend=c10d --rdzv_conf=store_type=file --local_addr=127.0.0.1 `
+  -m lithelm train "$RUN/resolved_config.yaml" `
+  --set runtime.device=cpu --set distributed.strategy=ddp
+```
+
+The launcher creates a temporary rendezvous file. LitheLM defaults `USE_LIBUV` to `0` on Windows for worker process-group initialization; an existing value takes precedence.
+
+For CPU DDP with a CUDA-enabled PyTorch build on Windows, use `accelerate==1.10.1`. Accelerate 1.11–1.15 pass GPU indices to CPU barriers, which can fail when CPU ranks outnumber visible GPUs.
 
 CPU execution rejects `runtime.precision: fp16`, including when `device: auto` resolves to CPU; use `fp32` or a supported CPU `bf16` path. With `runtime.deterministic: true`, LitheLM sets a missing `CUBLAS_WORKSPACE_CONFIG` to `:4096:8` before probing CUDA and enables PyTorch deterministic algorithms. Set this environment variable before initializing CUDA yourself. Determinism is best-effort: third-party and custom kernels can impose their own limits or raise errors.
 

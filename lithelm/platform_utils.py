@@ -17,6 +17,8 @@ def default_backend(cuda=True):
 
 def build_accelerator(cfg):
     r, d = cfg["runtime"], cfg["distributed"]
+    if platform.system() == "Windows":
+        os.environ.setdefault("USE_LIBUV", "0")
     if r["deterministic"] and r["device"] != "cpu":
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     from accelerate import Accelerator

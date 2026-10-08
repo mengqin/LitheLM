@@ -82,7 +82,7 @@ def infer_checkpoint(cfg,path,prompt):
                 output = root / "inference"
                 output.mkdir(exist_ok=True)
                 try:
-                    checkpoint = str(path.relative_to(root))
+                    checkpoint = path.relative_to(root).as_posix()
                 except ValueError:
                     checkpoint = str(path)
                 with (output/"samples.jsonl").open("a",encoding="utf-8") as f:

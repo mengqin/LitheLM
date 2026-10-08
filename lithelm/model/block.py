@@ -13,7 +13,7 @@ class Block(nn.Module):
         self.mixer = build_mixer(dim, cfg["mixer"], index)
         mixer = cfg["mixer"]
         self.supports_cache = mixer["type"] == "gdn" or (mixer["type"] == "attention" and
-            mixer["attention"]["causal"] and mixer["attention"]["impl"] in ("sdpa", "flash", "triton"))
+            mixer["attention"]["causal"] and mixer["attention"]["impl"] in ("sdpa", "flash", "flash2", "flash3", "triton"))
         self.ffn = FFN(dim, cfg["ffn"]) if cfg["ffn"]["enabled"] else None
         self.residual, self.pre = cfg["residual"], cfg["norm_position"] == "pre"
 

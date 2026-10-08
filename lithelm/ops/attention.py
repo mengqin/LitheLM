@@ -29,6 +29,21 @@ def attention_op(q, k, v, *, impl="sdpa", op=None, causal=True, mask=None, dropo
         with context:
             return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=dropout,
                                                   is_causal=causal and mask is None)
+    if impl in ("flash2", "flash3"):
+        if mask is not None:
+            raise ValueError(f"{impl} does not support attention masks; use impl: sdpa")
+        # External kernels align non-square causal masks differently from SDPA.
+        if causal and q.shape[-2] != k.shape[-2]:
+            raise ValueError(f"{impl} requires equal query/key lengths for causal attention")
+        kwargs = dict(causal=causal, deterministic=torch.are_deterministic_algorithms_enabled())
+        if impl == "flash2":
+            from flash_attn import flash_attn_func
+            kwargs["dropout_p"] = dropout
+        else:
+            if dropout:
+                raise ValueError("flash3 does not support attention dropout")
+            from flash_attn_interface import flash_attn_func
+        return flash_attn_func(*(x.transpose(1, 2) for x in (q, k, v)), **kwargs).transpose(1, 2)
     if impl == "triton":
         from .attention_triton import triton_attention
         if op not in (None, "attention_v1", "my_attention_v1"):

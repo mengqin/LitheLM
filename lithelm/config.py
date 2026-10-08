@@ -184,7 +184,7 @@ def validate_model(m, precision):
             if a["head_dim"] != dim // a["num_heads"]:
                 raise ValueError(p + ": head_dim must equal hidden_size / num_heads")
             a["attention_dropout"] = a["dropout"] if a["attention_dropout"] is None else a["attention_dropout"]
-            choice(a["impl"], ["sdpa", "flash", "triton", "custom"], p + ".attention.impl")
+            choice(a["impl"], ["sdpa", "flash", "flash2", "flash3", "triton", "custom"], p + ".attention.impl")
             if not a["causal"]:
                 raise ValueError(p + ": causal LM requires causal attention")
             if pos["type"] == "rope":

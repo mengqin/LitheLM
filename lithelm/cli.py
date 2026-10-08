@@ -2,11 +2,16 @@
 import argparse
 import json
 from pathlib import Path
+import sys
 
 from .config import load_config
 
 
 def main(argv=None):
+    if sys.platform == "win32":
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8")
     p = argparse.ArgumentParser(prog="lithelm")
     commands = p.add_subparsers(dest="command", required=True)
     commands.add_parser("doctor")

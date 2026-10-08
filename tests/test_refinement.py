@@ -174,6 +174,7 @@ def test_shared_inputs_paths_and_provenance(tmp_path, monkeypatch):
             record_environment(bound,tok)
             env = json.loads((root/"environment.json").read_text())
             assert env["versions"]["flash-linear-attention"] is None
+            assert env["versions"]["flash-attn"] is None and env["versions"]["flash-attn-3"] is None
             assert env["tokenizer_fingerprint"] and env["inputs"]["corpora"]["pt"]["path"]["bytes"] > 0
     assert roots[0] != roots[1] and roots[0].parent == tmp_path/"runs"
     assert artifact.stat().st_mtime_ns == timestamp
