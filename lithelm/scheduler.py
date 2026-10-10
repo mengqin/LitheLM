@@ -39,5 +39,8 @@ def wsd_scale(step, cfg):
     return minimum + (1.-minimum)*factor
 
 
-def build_scheduler(optimizer, cfg):
+def build_scheduler(optimizer, cfg, *, provider=None, max_steps=None, position=0):
+    if provider is not None:
+        from .lr_provider import ProviderScheduler
+        return ProviderScheduler(optimizer,provider,max_steps,position)
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: wsd_scale(step,cfg))

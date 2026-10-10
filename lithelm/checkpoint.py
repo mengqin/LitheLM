@@ -14,6 +14,14 @@ def signature(cfg, tokenizer):
     relevant = deepcopy({k:cfg[k] for k in ("model","datasets","stages","runtime")})
     # Default shifted semantics retain the pre-targets checkpoint signature.
     for stage in relevant["stages"]:
+        if stage["lr_schedule"].get("type", "wsd") == "wsd":
+            for key in ("path","name","kwargs"):
+                stage["lr_schedule"].pop(key,None)
+        if stage.get("loss", {}).get("type", "default") == "default":
+            stage.pop("loss", None)
+        if stage["data"].get("strategy", "default") == "default":
+            stage["data"].pop("strategy", None)
+            stage["data"].pop("step_plan", None)
         if stage.get("targets", {}).get("mode", "shifted") == "shifted":
             stage.pop("targets", None)
     relevant["tokenizer_hash"] = tokenizer_fingerprint(tokenizer)

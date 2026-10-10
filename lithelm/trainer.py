@@ -11,6 +11,8 @@ from .evaluate import evaluate
 from .infer import generate
 from .metrics import STATS, meter_metrics
 from .statistics import ScalarStats
+from .extensions import PlannedBatch, StepContext, agree, checked, prepare_extensions, validate_batch
+from .loss_composition import ComposedUpdate, target_count
 from .scheduler import build_optimizer, build_scheduler, wsd_phase
 
 
@@ -27,6 +29,7 @@ class Trainer:
                           lr_phase="warmup",scheduler_position=0,meters={},samples_seen=0,tokens_seen=0,best_value=None)
         self.latest = {}
         self.stream = None
+        self.extensions = None
         self.start = time.perf_counter()
 
     def emit(self,metrics):
@@ -45,10 +48,19 @@ class Trainer:
             self.model = self.optimizer = self.scheduler = None
             self.a.free_memory()
         self.stage = stage
+        if self.extensions is None:
+            self.extensions, self.extension_identities = prepare_extensions(self.cfg, self.tokenizer, self.a)
+        self.plan, self.composer, self.lr_provider = self.extensions[index]
+        identity = self.extension_identities.get(stage["name"],{})
+        self.component_names = tuple(identity["loss_composer"]["components"]) if self.composer is not None else None
+        if resume and read_state(resume,self.a).get("extensions", {}) != self.extension_identities:
+            raise ValueError("Frozen training extension identity differs from checkpoint")
         if not resume:
             self.state.update(stage_index=index,stage_name=stage["name"],stage_step=0,curriculum_index=-1,
                               lr_phase="warmup",scheduler_position=0,meters={},best_value=None)
             self.latest = {}
+        if self.extension_identities:
+            self.state["extensions"] = self.extension_identities
         self.a.gradient_accumulation_steps = stage["batch"]["grad_accum_steps"]
         init = stage["init_from"]
         source = self.root / init["stage"] / init["checkpoint"] if init["stage"] else None
@@ -61,7 +73,18 @@ class Trainer:
         if not (source and not resume and init["load_scheduler"]):
             for group in optimizer.param_groups:
                 group["lr"] = group["initial_lr"] = stage["optimizer"]["lr"]
-        scheduler = build_scheduler(optimizer,stage["lr_schedule"])
+        position = self.state["stage_step"] if resume else (source_state["stage_step"] if source_state and not init["reset_stage_step"] else 0)
+        if resume:
+            position = read_state(resume,self.a)["stage_step"]
+        if self.lr_provider is not None and source and not resume and init["load_scheduler"]:
+            source_identity = source_state.get("extensions",{}).get(init["stage"],{}).get("lr_provider")
+            if source_identity != self.extension_identities[stage["name"]]["lr_provider"]:
+                raise ValueError("Continued LRProvider identity differs from source checkpoint")
+        if self.lr_provider is None:
+            scheduler = build_scheduler(optimizer,stage["lr_schedule"])
+        else:
+            scheduler = checked(self.a, lambda:build_scheduler(optimizer,stage["lr_schedule"],
+                                provider=self.lr_provider,max_steps=stage["max_steps"],position=position))
         if source and not resume:
             if init["load_scheduler"]:
                 scheduler.load_state_dict(torch.load(source/"scheduler.bin",map_location="cpu",weights_only=True))
@@ -76,6 +99,8 @@ class Trainer:
             self.state = load_checkpoint(resume,self.a,self.cfg,self.tokenizer)
             metrics = Path(resume)/"metrics.json"
             self.latest = json.loads(metrics.read_text()) if metrics.exists() else {}
+        if self.lr_provider is not None:
+            agree([group["lr"] for group in self.optimizer.param_groups],self.a)
         self.stream = None
         self.window_input_tokens = self.window_target_tokens = self.window_samples = self.window_seconds = 0
         self.last_eval_step = -1
@@ -89,8 +114,14 @@ class Trainer:
                    "data/max_targets_per_update":global_batch*(stage["data"]["max_length"]-int(stage["targets"]["mode"] == "shifted")),
                    "optim/reset":not resume and not init["load_optimizer"],
                    "optim/scheduler_reset":not resume and not init["load_scheduler"]})
+        if self.extension_identities and self.a.is_main_process:
+            (self.root/"extensions.json").write_text(json.dumps(self.extension_identities,indent=2,allow_nan=False),encoding="utf-8")
+        if self.extension_identities and self.cfg["workspace"]["copy_inputs"]:
+            self.emit({"event":"external_extension_assets","workspace/extensions_bundled":False})
 
     def update_curriculum(self):
+        if self.plan is not None:
+            return
         index,data = curriculum(self.stage,self.state["stage_step"])
         if self.stream is None or index != self.state["curriculum_index"]:
             with self.a.main_process_first():
@@ -147,17 +178,44 @@ class Trainer:
         started = time.perf_counter()
         step = self.state["stage_step"]
         accumulation,size = stage["batch"]["grad_accum_steps"],stage["batch"]["micro_batch_size"]
-        batches = [self.stream.batch(step*accumulation+i,size) for i in range(accumulation)]
+        if self.plan is None:
+            batches = [self.stream.batch(step*accumulation+i,size) for i in range(accumulation)]
+            if self.composer is not None:
+                planned = [PlannedBatch(**batch,source_name=name,objective=objective) for batch,name,objective in batches]
+        else:
+            planned = checked(a, lambda:[validate_batch(self.plan.batch_at(step,a.process_index,i), stage,
+                                        self.cfg["model"]["vocab_size"], require_labels=self.composer is None) for i in range(accumulation)])
+            batches = [(batch.model_inputs(),batch.source_name or "step_plan",batch.objective or stage["type"]) for batch in planned]
         mode = stage["targets"]["mode"]
-        local_count = sum(batch["labels"][:,int(mode == "shifted"):].ne(-100).sum().item() for batch,_,_ in batches)
+        local_count = 0 if self.composer is not None else sum(
+            batch["labels"][:,int(mode == "shifted"):].ne(-100).sum().item() for batch,_,_ in batches)
+        if self.composer is not None:
+            planned = [batch.to(a.device) for batch in planned]
+            target_counts = [target_count(batch,mode) for batch in planned]
+            local_count = sum(target_counts)
+            context = StepContext(stage["name"],step,a.process_index,mode)
+            composed = ComposedUpdate(self.composer,planned,context,a,self.component_names)
+            self.component_names = composed.names
         input_count = sum(batch["attention_mask"].sum().item() if "attention_mask" in batch else batch["input_ids"].numel() for batch,_,_ in batches)
         counts = a.reduce(torch.tensor([input_count,local_count,size*accumulation],device=a.device,dtype=torch.float64),reduction="sum")
         total_count = counts[1]
-        if total_count.item() <= 0:
+        if self.composer is None and total_count.item() <= 0:
             raise ValueError("No valid targets in optimizer update")
         names = [r["name"] for r in stage["data"]["datasets"]]
-        meters = torch.zeros(len(names),3,device=a.device,dtype=torch.float64)
         objectives = {r["name"]:r["objective"] or self.cfg["datasets"][r["name"]]["objective"] for r in stage["data"]["datasets"]}
+        if self.plan is not None:
+            sources = [[(name,objective) for _,name,objective in batches]]
+            if a.num_processes > 1:
+                sources = [None]*a.num_processes
+                torch.distributed.all_gather_object(sources, [(name,objective) for _,name,objective in batches])
+            objectives = {}
+            for source in sources:
+                for name,objective in source:
+                    if name in objectives and objectives[name] != objective:
+                        raise ValueError("Planned source_name must have one objective across ranks/microbatches")
+                    objectives[name] = objective
+            names = sorted(objectives)
+        meters = torch.zeros(len(names),3,device=a.device,dtype=torch.float64)
         stats_due = due(step+1,stage["intervals"]["stats"])
         items = stage["stats"]["items"]
         statistics = self.cfg["statistics"]
@@ -165,20 +223,29 @@ class Trainer:
         internals = ScalarStats(statistics, self.stat_specs, a)
         before = [p.detach().clone() for p in self.model.parameters()] if stats_due and {"update_norm","update_ratio"} & set(items) else None
         lr = self.optimizer.param_groups[0]["lr"]
-        phase = wsd_phase(self.scheduler.scheduler.last_epoch,stage["lr_schedule"])
+        phase = wsd_phase(self.scheduler.scheduler.last_epoch,stage["lr_schedule"]) if self.lr_provider is None else stage["lr_schedule"]["type"]
         self.model.train()
         grad_norm = 0.
-        for batch,name,objective in batches:
-            batch = {k:v.to(a.device) for k,v in batch.items()}
+        for microbatch_index,(batch,name,objective) in enumerate(batches):
+            if self.composer is None:
+                batch = {k:v.to(a.device) for k,v in batch.items()}
             with a.accumulate(self.model):
                 with a.autocast():
-                    out = self.model(**batch,collect_stats=collect,target_mode=mode)
+                    inputs = batch if self.composer is None else planned[microbatch_index].model_inputs(labels=False)
+                    out = self.model(**inputs,collect_stats=collect,target_mode=mode)
                 # DDP averages ranks, Accelerate divides accumulation. Undo both
                 # normalizations, then divide by actual global target-token count.
-                a.backward(out.loss_sum*(a.num_processes*accumulation/total_count))
+                if self.composer is None:
+                    a.backward(out.loss_sum*(a.num_processes*accumulation/total_count))
+                else:
+                    loss = composed.loss(out,planned[microbatch_index],microbatch_index)
+                    a.backward(loss*(a.num_processes*accumulation))
                 row = names.index(name)
-                meters[row,0] += out.loss_sum.detach().double()
-                meters[row,1] += out.token_count
+                if self.composer is None:
+                    meters[row,0] += out.loss_sum.detach().double()
+                    meters[row,1] += out.token_count
+                else:
+                    meters[row,1] += target_counts[microbatch_index]
                 meters[row,2] += size
                 if a.sync_gradients:
                     grad_norm = a.clip_grad_norm_(self.model.parameters(),stage["batch"]["max_grad_norm"] or float("inf")).item()
@@ -190,10 +257,16 @@ class Trainer:
                                 f"precision={self.cfg['runtime']['precision']} grad_norm={grad_norm}")
                 self.optimizer.step()
                 if a.sync_gradients and not a.optimizer_step_was_skipped:
-                    self.scheduler.step()
+                    if self.lr_provider is None:
+                        self.scheduler.step()
+                    else:
+                        checked(a,self.scheduler.step)
+                        agree([group["lr"] for group in self.optimizer.param_groups],a)
                 self.optimizer.zero_grad(set_to_none=True)
                 if collect:
                     internals.add(out.stats)
+                if self.composer is not None:
+                    del out, loss
         if a.device.type == "cuda":
             torch.cuda.synchronize(a.device)
         elapsed = torch.tensor(time.perf_counter()-started, device=a.device, dtype=torch.float64)
@@ -213,10 +286,16 @@ class Trainer:
         if not torch.isfinite(meters).all() or not torch.isfinite(torch.tensor(grad_norm)):
             raise FloatingPointError("Non-finite training loss or gradient norm")
         values = a.reduce(meters,reduction="sum").tolist()
+        source_metrics = {}
         for name,values in zip(names,values):
-            bucket = self.state["meters"].setdefault(name,[0.,0.,0.,objectives[name]])
-            for i,value in enumerate(values):
-                bucket[i] += value
+            if self.composer is None:
+                bucket = self.state["meters"].setdefault(name,[0.,0.,0.,objectives[name]])
+                for i,value in enumerate(values):
+                    bucket[i] += value
+            else:
+                source_metrics.update({f"data/source_samples/{name}":values[2],
+                                       f"data/source_targets/{name}":values[1],
+                                       f"data/source_objective/{name}":objectives[name]})
             self.state["tokens_seen"] += int(values[1])
             self.state["samples_seen"] += int(values[2])
         self.state["stage_step"] += 1
@@ -224,6 +303,10 @@ class Trainer:
         self.state["lr_phase"] = phase
         self.state["scheduler_position"] = self.scheduler.scheduler.last_epoch
         common = {"optim/lr":lr,"optim/wsd_phase":phase,"optim/grad_norm":grad_norm}
+        if self.lr_provider is not None:
+            common.pop("optim/wsd_phase")
+            common["optim/lr_phase"] = phase
+        training_metrics = meter_metrics(self.state["meters"]) if self.composer is None else {**composed.metrics(),**source_metrics}
         if stats_due:
             stats = {}
             stats.update({key:value for key,value in throughput.items() if key.removeprefix("perf/") in items})
@@ -231,14 +314,14 @@ class Trainer:
                 if name in STATS and name != "grad_norm":
                     key = "perf/gpu_memory_gb" if name == "gpu_memory" else "optim/"+name
                     stats[key] = STATS[name](self.model,before=before)
-            self.emit({**common,**stats,**meter_metrics(self.state["meters"]),"event":"stats"})
+            self.emit({**common,**stats,**training_metrics,"event":"stats"})
         if collect:
             selected = stage["stats"]["model_internal"]["items"]
             values = {k:v for k,v in internals.finish().items()
                       if statistics["every"] is not None or not selected or k.rsplit("/",1)[-1] in selected}
             self.emit({**values, "event":"model_stats"})
         if due(self.state["stage_step"],stage["intervals"]["log"]):
-            self.emit({**common,**meter_metrics(self.state["meters"]),**throughput,"event":"train",
+            self.emit({**common,**training_metrics,**throughput,"event":"train",
                        "perf/gpu_memory_gb":STATS["gpu_memory"](self.model)})
             self.state["meters"] = {}
             self.window_input_tokens = self.window_target_tokens = self.window_samples = self.window_seconds = 0

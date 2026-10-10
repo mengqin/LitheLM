@@ -227,6 +227,11 @@ def test_legacy_signature_and_default_tokenizer_root(tmp_path, monkeypatch):
     current = signature(cfg, tok)
     for stage in cfg["stages"]:
         stage.pop("targets")
+        stage.pop("loss")
+        for key in ("path","name","kwargs"):
+            stage["lr_schedule"].pop(key)
+        stage["data"].pop("strategy")
+        stage["data"].pop("step_plan")
     legacy = {key:cfg[key] for key in ("model","datasets","stages","runtime")}
     legacy.update(tokenizer_hash=tokenizer_fingerprint(tok), seed=cfg["experiment"]["seed"])
     assert current == hashlib.sha256(json.dumps(legacy,sort_keys=True).encode()).hexdigest()

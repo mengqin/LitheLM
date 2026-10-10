@@ -479,6 +479,11 @@ CPU execution rejects `runtime.precision: fp16`, including when `device: auto` r
 
 ## Project structure
 
+For exact step-indexed inputs, independent loss normalization, or frozen per-update
+learning rates, see [the explicit training extension APIs](examples/extensions/README.md).
+These optional hooks use the existing Trainer and require registration in an
+external Python launch module on each rank.
+
 ```text
 lithelm/
 ├── cli.py, config.py           # CLI and validated configuration

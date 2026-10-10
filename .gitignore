@@ -3,6 +3,7 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 .venv/
+/working-dir/
 data/
 outputs/
 corpora/

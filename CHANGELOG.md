@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Reject composite-loss updates without a globally present, nonzero-weight component before model or optimizer execution.
+- Verify configured frozen extension file contents on every rank during initialization and resume preflight.
+
 ## 0.1.0 - 2026-10-07
 
 Initial release.

@@ -1,0 +1,45 @@
+# Synthetic example fragment completed by run.py --init.
+version: 1
+experiment: {name: extensions, seed: 17}
+runtime: {device: cpu, precision: fp32}
+tokenizer:
+  vocab_size: 280
+  train_from: {dataset: bootstrap, sample_bytes: 2000}
+model:
+  vocab_size: 280
+  hidden_size: 16
+  max_position_embeddings: 32
+  position_embedding: {type: learned_absolute, max_positions: 32}
+  layer_defaults:
+    norm: {type: layernorm}
+    mixer:
+      attention: {num_heads: 2}
+    ffn: {type: standard, hidden_size: 32}
+  layers: [{type: transformer}]
+datasets:
+  bootstrap: {source: text, path: bootstrap.txt}
+stages:
+  - name: pt
+    max_steps: 4
+    batch: {micro_batch_size: 2, grad_accum_steps: 2}
+    data:
+      strategy: step_plan
+      max_length: 16
+      step_plan: {name: synthetic, path: plan.json}
+    loss: {type: custom, name: masked_ce}
+    lr_schedule: {type: values_file, path: lr-pt.bin}
+    intervals: {log: 1, stats: 2, eval: 2, checkpoint: 2}
+    eval: {datasets: [bootstrap], max_batches: 1}
+  - name: sft
+    type: sft
+    max_steps: 3
+    init_from: {stage: pt, load_optimizer: true}
+    batch: {micro_batch_size: 2, grad_accum_steps: 3}
+    data:
+      strategy: step_plan
+      max_length: 16
+      step_plan: {name: synthetic, path: plan.json}
+    loss: {type: custom, name: masked_ce}
+    lr_schedule: {type: values_file, path: lr-sft.bin}
+    intervals: {log: 1, stats: 2, eval: 2, checkpoint: 2}
+    eval: {datasets: [bootstrap], max_batches: 1}

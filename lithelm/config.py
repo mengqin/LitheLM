@@ -27,11 +27,14 @@ STAGE = dict(name=None, type="pt", max_steps=None, targets=dict(mode=None),
              init_from=dict(stage=None, checkpoint="final", load_model=True,
                             load_optimizer=False, load_scheduler=False, reset_stage_step=True),
              batch=dict(micro_batch_size=1, grad_accum_steps=1, max_grad_norm=1.),
-             data=dict(max_length=256, packing=False, datasets=[]), curriculum=[],
+             data=dict(strategy="default", max_length=256, packing=False, datasets=[],
+                       step_plan=dict(name=None, path=None, kwargs={})), curriculum=[],
+             loss=dict(type="default", name=None, kwargs={}),
              optimizer=dict(type="adamw", lr=3e-4, betas=[.9,.95], eps=1e-8,
                             weight_decay=0., exclude_from_weight_decay=["bias","norm","embedding"]),
              lr_schedule=dict(type="wsd", warmup_steps=0, stable_steps=None,
-                              decay_steps=0, peak_lr=None, min_lr=0., decay_style="linear"),
+                              decay_steps=0, peak_lr=None, min_lr=0., decay_style="linear",
+                              path=None, name=None, kwargs={}),
              intervals=dict(log=10, stats=100, eval=1000, checkpoint=5000),
              stats=dict(items=["grad_norm","param_norm","gpu_memory"],
                         model_internal=dict(enabled=False, items=[])),
@@ -300,6 +303,22 @@ def normalize(raw):
             integer(s["batch"][k], p + ".batch." + k)
         positive(s["batch"]["max_grad_norm"], p + ".batch.max_grad_norm", zero=True)
         refs = s["data"]["datasets"]
+        choice(s["loss"]["type"], ["default", "custom"], p + ".loss.type")
+        if s["loss"]["type"] == "custom" and not s["loss"]["name"]:
+            raise ValueError(p + ": custom loss requires a registered name")
+        if s["loss"]["type"] == "default" and s["loss"] != STAGE["loss"]:
+            raise ValueError(p + ": loss name/kwargs require loss.type=custom")
+        choice(s["data"]["strategy"], ["default", "step_plan"], p + ".data.strategy")
+        if s["data"]["strategy"] == "step_plan":
+            if not s["data"]["step_plan"]["name"]:
+                raise ValueError(p + ": step_plan requires a registered name")
+            if s["curriculum"] or s["data"]["packing"] or refs:
+                raise ValueError(p + ": step_plan requires empty curriculum/datasets and packing=false")
+            spec = s["data"]["step_plan"]
+            if spec["path"]:
+                spec["path"] = str(Path(spec["path"]).resolve())
+        elif s["data"]["step_plan"] != STAGE["data"]["step_plan"]:
+            raise ValueError(p + ": step_plan fields require data.strategy=step_plan")
         for j, ref in enumerate(refs):
             refs[j] = merge(dict(name=None, weight=1., objective=None), ref, p + ".data.datasets")
             if refs[j]["name"] not in cfg["datasets"]:
@@ -308,7 +327,8 @@ def normalize(raw):
                 choice(refs[j]["objective"], ["pt", "sft"], p + ".objective")
         if len({x["name"] for x in refs}) != len(refs):
             raise ValueError(p + ": duplicate dataset reference")
-        weights([x["weight"] for x in refs], p + ".data.weights")
+        if s["data"]["strategy"] == "default":
+            weights([x["weight"] for x in refs], p + ".data.weights")
         lengths = [s["data"]["max_length"]]
         last = 0
         for j, phase in enumerate(s["curriculum"]):
@@ -338,19 +358,33 @@ def normalize(raw):
         positive(o["weight_decay"], p + ".optimizer.weight_decay", zero=True)
         if len(o["betas"]) != 2 or any(not 0 <= b < 1 for b in o["betas"]):
             raise ValueError(p + ": Adam betas must be in [0, 1)")
-        choice(w["type"], ["wsd"], p + ".lr_schedule.type")
-        choice(w["decay_style"], ["linear", "cosine"], p + ".decay_style")
-        w["peak_lr"] = o["lr"] if w["peak_lr"] is None else w["peak_lr"]
-        positive(w["peak_lr"],p + ".lr_schedule.peak_lr")
-        o["lr"] = w["peak_lr"]
-        if w["stable_steps"] is None:
-            w["stable_steps"] = s["max_steps"] - w["warmup_steps"] - w["decay_steps"]
-        for k in ("warmup_steps", "stable_steps", "decay_steps"):
-            integer(w[k], p + ".lr_schedule." + k, zero=True)
-        if sum(w[k] for k in ("warmup_steps", "stable_steps", "decay_steps")) != s["max_steps"]:
-            raise ValueError(p + ": WSD steps must sum to max_steps")
-        if not 0 <= w["min_lr"] <= o["lr"]:
-            raise ValueError(p + ": min_lr must be between 0 and peak_lr")
+        choice(w["type"], ["wsd", "values_file", "custom"], p + ".lr_schedule.type")
+        if w["type"] == "wsd":
+            if w["path"] or w["name"] or w["kwargs"]:
+                raise ValueError(p + ": WSD does not accept provider path/name/kwargs")
+            choice(w["decay_style"], ["linear", "cosine"], p + ".decay_style")
+            w["peak_lr"] = o["lr"] if w["peak_lr"] is None else w["peak_lr"]
+            positive(w["peak_lr"],p + ".lr_schedule.peak_lr")
+            o["lr"] = w["peak_lr"]
+            if w["stable_steps"] is None:
+                w["stable_steps"] = s["max_steps"] - w["warmup_steps"] - w["decay_steps"]
+            for k in ("warmup_steps", "stable_steps", "decay_steps"):
+                integer(w[k], p + ".lr_schedule." + k, zero=True)
+            if sum(w[k] for k in ("warmup_steps", "stable_steps", "decay_steps")) != s["max_steps"]:
+                raise ValueError(p + ": WSD steps must sum to max_steps")
+            if not 0 <= w["min_lr"] <= o["lr"]:
+                raise ValueError(p + ": min_lr must be between 0 and peak_lr")
+        elif w["type"] == "values_file":
+            if not w["path"] or w["name"] or w["kwargs"]:
+                raise ValueError(p + ": values_file requires path and no name/kwargs")
+            w["path"] = str(Path(w["path"]).resolve())
+            if not Path(w["path"]).is_file() or Path(w["path"]).stat().st_size != s["max_steps"]*8:
+                raise ValueError(p + ": LR values_file must exist and contain exactly max_steps float64 values")
+        elif not w["name"]:
+            raise ValueError(p + ": custom LR requires a registered name")
+        if w["type"] != "wsd" and any(w[k] != STAGE["lr_schedule"][k] for k in
+                                         ("warmup_steps","stable_steps","decay_steps","peak_lr","min_lr","decay_style")):
+            raise ValueError(p + ": external LR providers do not accept WSD settings")
         for k, v in s["intervals"].items():
             integer(v or 0, p + ".intervals." + k, zero=True)
         if s["checkpoint"]["keep_last"] is not None:
@@ -392,7 +426,9 @@ def normalize(raw):
         if init["load_scheduler"]:
             previous = next(x for x in cfg["stages"][:i] if x["name"] == init["stage"])
             if previous["lr_schedule"] != s["lr_schedule"]:
-                raise ValueError(p + ": continued scheduler requires identical WSD configuration")
+                raise ValueError(p + ": continued scheduler requires identical schedule configuration")
+            if w["type"] != "wsd" and (init["reset_stage_step"] or previous["max_steps"] != s["max_steps"]):
+                raise ValueError(p + ": continued LRProvider requires reset_stage_step=false and identical max_steps")
     if not cfg["stages"]:
         raise ValueError("stages: at least one stage required")
     if not cfg["logging"]["rank0_only"]:
@@ -431,7 +467,12 @@ def load_config(path, overrides=()):
     root = find_run(path)
     for key in cfg.paths:
         cfg.paths[key] = str(((root or Path.cwd()) / cfg.paths[key]).resolve())
-    cfg = normalize(OmegaConf.to_container(cfg, resolve=True))
+    raw = OmegaConf.to_container(cfg, resolve=True)
+    for stage in raw.get("stages", []):
+        for spec in (stage.get("data", {}).get("step_plan", {}),stage.get("lr_schedule", {})):
+            if spec.get("path"):
+                spec["path"] = str(((root or path.parent) / spec["path"]).resolve())
+    cfg = normalize(raw)
     if root is not None:
         cfg["experiment"]["output_dir"] = str(root)
     else:
